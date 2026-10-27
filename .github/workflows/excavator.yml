@@ -1,0 +1,673 @@
+name: Font updates
+
+on:
+  workflow_dispatch:
+    inputs:
+      native_smoke:
+        description: Verify actual font install, blocked upgrade, retry and uninstall on Windows
+        type: boolean
+        default: false
+  schedule:
+    - cron: '27 */4 * * *'
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: excavator
+  cancel-in-progress: false
+
+jobs:
+  excavate:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && !inputs.native_smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate and publish font updates
+        id: update
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const {execFileSync} = require('child_process');
+            const git = (...args) => execFileSync('git',args,{encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
+            const errors = [], checked = [], updates = [], releases = new Map();
+            const numeric = /^\d+\.\d+(?:\.\d+){0,2}$/;
+            const compare = (a,b) => {
+              const x=a.split('.').map(BigInt), y=b.split('.').map(BigInt);
+              for(let i=0;i<Math.max(x.length,y.length);i++){
+                if((x[i]||0n)!==(y[i]||0n)) return (x[i]||0n)>(y[i]||0n)?1:-1;
+              }
+              return 0;
+            };
+            try {
+              if(context.ref !== 'refs/heads/'+context.payload.repository.default_branch) throw new Error('Automatic updates only publish on the default branch');
+              for(const file of fs.readdirSync('bucket').filter(x=>x.endsWith('.json')).sort()) {
+                try {
+                  const manifest = JSON.parse(fs.readFileSync(path.join('bucket',file),'utf8'));
+                  if(!manifest.checkver) continue;
+                  if(!numeric.test(manifest.version)) throw new Error('Unexpected manifest version format');
+                  const upstream = new URL(manifest.checkver.github);
+                  const parts = upstream.pathname.split('/').filter(Boolean);
+                  if(upstream.origin!=='https://github.com' || parts.length!==2) throw new Error('Expected an official GitHub upstream repository');
+                  const repository = parts.join('/');
+                  if(!releases.has(repository)) releases.set(repository,github.rest.repos.getLatestRelease({owner:parts[0],repo:parts[1]}).then(r=>r.data));
+                  const release = await releases.get(repository);
+                  const version = release.tag_name.replace(/^v/i,'');
+                  if(release.draft || release.prerelease || !numeric.test(version)) throw new Error('Unexpected stable release tag format');
+                  const order = compare(version,manifest.version);
+                  if(order<0) throw new Error('Latest upstream version is older than the manifest; refusing downgrade');
+                  const expectedUrl = manifest.autoupdate.url.replaceAll('$version',version);
+                  let autoupdate=manifest.autoupdate;
+                  let matches = release.assets.filter(a=>a.browser_download_url===expectedUrl);
+                  if(!matches.length && order>0) {
+                    const name=decodeURIComponent(new URL(expectedUrl).pathname.split('/').pop());
+                    const root='https://github.com/'+repository+'/releases/download/';
+                    const official=root+encodeURIComponent(release.tag_name)+'/'+encodeURIComponent(name);
+                    matches=release.assets.filter(a=>a.name===name && a.browser_download_url===official);
+                    if(matches.length===1) autoupdate={...autoupdate,url:root+release.tag_name.replace(version,'$version')+'/'+autoupdate.url.split('/').pop()};
+                  }
+                  if(matches.length!==1) {
+                    const available=release.assets.filter(a=>/\.(zip|7z)$/i.test(a.name)).map(a=>a.name).sort().slice(0,12).join(', ');
+                    throw new Error('Expected release asset is missing or ambiguous; upstream filenames changed: '+expectedUrl+'. Available archives (first 12): '+available+'. Release: https://github.com/'+repository+'/releases/tag/'+encodeURIComponent(release.tag_name));
+                  }
+                  const asset = matches[0];
+                  const url=asset.browser_download_url;
+                  if(!(asset.size>0) || !/^sha256:[a-f0-9]{64}$/.test(asset.digest||'')) throw new Error('Release asset is empty or its published SHA-256 is unavailable');
+                  const hash = asset.digest.substring(7);
+                  if(order===0 && (manifest.url!==url || String(manifest.hash).toLowerCase()!==hash)) throw new Error('Upstream changed files under the same release version; review URL/hash manually');
+                  checked.push(file+': '+version);
+                  if(order>0) updates.push({file,manifest:{...manifest,version,url,hash,autoupdate}});
+                }catch(error){errors.push(file+': '+error.message);}
+              }
+              if(!checked.length && !errors.length) errors.push('No automatically maintained font manifests found');
+              if(!errors.length && updates.length) {
+                if(git('rev-parse','HEAD')!==context.sha) throw new Error('Checkout HEAD differs from this run; refusing publication');
+                for(const update of updates) fs.writeFileSync(path.join('bucket',update.file),JSON.stringify(update.manifest,null,2)+'\n');
+                git('config','user.name','github-actions[bot]');
+                git('config','user.email','41898282+github-actions[bot]@users.noreply.github.com');
+                git('add','--',...updates.map(x=>'bucket/'+x.file));
+                git('commit','-m','Update '+updates.length+' font packages');
+                // The explicit lease rejects any intervening branch change.
+                git('push','--force-with-lease='+context.ref+':'+context.sha,'origin','HEAD:'+context.ref);
+                core.notice('Published one validated commit for '+updates.length+' font packages.');
+              }
+              await core.summary.addHeading('字体源检查').addRaw(checked.map(x=>'- '+x).join('\n')+'\n\n更新清单：'+(errors.length?'0（校验失败）':updates.length)).write();
+            }catch(error){errors.push(error.message);}
+            core.setOutput('errors',JSON.stringify(errors));
+            if(errors.length){
+              for(const error of errors) core.error(error);
+              await core.summary.addHeading('字体源更新失败').addRaw(errors.map(x=>'- '+x).join('\n')).write();
+              core.setFailed('Font update validation or publication failed; see the failure issue and Actions log.');
+            }else{
+              core.notice('Validated '+checked.length+' font packages with '+releases.size+' upstream queries.');
+            }
+      - name: Report failure or recovery
+        if: always() && !cancelled()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          FONT_UPDATE_JOB_STATUS: ${{ job.status }}
+          FONT_UPDATE_ERRORS: ${{ steps.update.outputs.errors }}
+        with:
+          script: |
+            const crypto = require('crypto');
+            const title = '[字体源] 自动更新失败';
+            const marker = '<!-- scoop-font-update-failure -->';
+            const runUrl = 'https://github.com/'+context.repo.owner+'/'+context.repo.repo+'/actions/runs/'+context.runId;
+            const failed = process.env.FONT_UPDATE_JOB_STATUS !== 'success';
+            try {
+              let errors;
+              try {
+                errors=JSON.parse(process.env.FONT_UPDATE_ERRORS||'[]');
+                if(!Array.isArray(errors)) throw new Error('Expected an error list');
+              }catch{errors=['无法读取更新步骤的错误详情，请查看 Actions 日志。'];}
+              const issues = await github.paginate(github.rest.issues.listForRepo,{...context.repo,state:'open',per_page:100});
+              const existing = issues.find(x=>!x.pull_request && String(x.body||'').includes(marker));
+              if(failed) {
+                if(!errors.length) errors=['更新步骤或工作流执行失败，请查看运行日志。'];
+                const fingerprint = crypto.createHash('sha256').update(errors.join('\n')).digest('hex');
+                const stamp = '<!-- error:'+fingerprint+' -->';
+                const body = marker+'\n'+stamp+'\n\n字体源自动更新失败，需要检查上游文件或清单规则。\n\n'+errors.map(x=>'- '+x).join('\n')+'\n\n[查看 Actions 运行日志]('+runUrl+')';
+                if(!existing) {
+                  const repository = (await github.rest.repos.get(context.repo)).data;
+                  const assignees = repository.owner.type==='User' ? [repository.owner.login] : [];
+                  await github.rest.issues.create({...context.repo,title,body,assignees});
+                }else if(!String(existing.body||'').includes(stamp)) {
+                  await github.rest.issues.update({...context.repo,issue_number:existing.number,title,body});
+                  await github.rest.issues.createComment({...context.repo,issue_number:existing.number,body:'失败原因发生变化，请查看更新后的说明。\n\n[本次运行]('+runUrl+')'});
+                }
+                core.error('Font update failed. See the repository failure issue and Actions summary.');
+              }else if(existing) {
+                await github.rest.issues.createComment({...context.repo,issue_number:existing.number,body:'检查与清单发布已恢复正常。\n\n[成功运行]('+runUrl+')'});
+                await github.rest.issues.update({...context.repo,issue_number:existing.number,state:'closed',state_reason:'completed'});
+              }
+            }catch(error) {
+              core.warning('无法更新失败提示 Issue；请在 Actions 页面查看失败记录，并确认仓库已启用 Issues。 '+error.message);
+            }
+
+  native_smoke:
+    if: github.event_name == 'workflow_dispatch' && inputs.native_smoke && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: windows-2025
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify actual font lifecycle
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # This script performs real font operations. Execute only in the optional hosted CI job.
+          if ($env:GITHUB_ACTIONS -cne 'true' -or $env:RUNNER_OS -cne 'Windows' -or
+              $env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or
+              [Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+              throw 'Native font verification is restricted to a disposable GitHub-hosted Windows runner. Local execution is forbidden.'
+          }
+          if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'Run this CI harness with pwsh 7 or later.' }
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if (-not ([Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole(
+              [Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'The hosted runner must have administrator privileges.' }
+          
+          $runWatch = [Diagnostics.Stopwatch]::StartNew()
+          $appName = 'MapleMono-OTF'
+          $package = 'smoke/' + $appName
+          $oldVersion = '7.7'
+          $scoopPin = 'e6aa3b366bdee8ed138c1e0f7b85192ebdd35d0f'
+          $oldDigest = '8dcac8fe45a1255e183a420b16f8f61de9d1eea2b79acd03d25b1dba55525bed'
+          $testRoot = Join-Path $env:RUNNER_TEMP ('font-native-smoke-' + [Guid]::NewGuid().ToString('N'))
+          $evidenceRoot = Join-Path $testRoot 'evidence'
+          $env:SCOOP = Join-Path $testRoot 'scoop'
+          $env:SCOOP_GLOBAL = Join-Path $testRoot 'global'
+          $env:SCOOP_CACHE = Join-Path $env:SCOOP 'cache'
+          $env:GIT_TERMINAL_PROMPT = '0'
+          $core = Join-Path $env:SCOOP 'apps\scoop\current'
+          $packageRoot = Join-Path $env:SCOOP_GLOBAL ('apps\' + $appName)
+          $machineFonts = [IO.Path]::GetFullPath((Join-Path $env:WINDIR 'Fonts')).TrimEnd('\')
+          $userFonts = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Fonts')).TrimEnd('\')
+          $fontRoots = @($machineFonts, $userFonts)
+          $scoopHost = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+          $scoopScript = Join-Path $core 'bin\scoop.ps1'
+          $summary = [ordered]@{
+              Status = 'running'; ScoopCommit = $scoopPin; OldVersion = $oldVersion; NewVersion = $null
+              ArchiveBytes = 0; Commands = [Collections.Generic.List[object]]::new()
+              Phases = [Collections.Generic.List[object]]::new(); QueuedCleanup = @()
+              LockParentPid = $PID; LockParentObservable = $false; LockParentReported = $false
+              Failure = $null; FailureCleanup = $null; TotalSeconds = 0
+          }
+          $failure = $null
+          $fontLock = $null
+          $installationStarted = $false
+          $uninstalled = $false
+          $baseline = $null
+          $baselineFonts = @{}
+          
+          function Assert-Smoke([bool]$Condition, [string]$Message) {
+              if (-not $Condition) { throw $Message }
+          }
+          function Write-SmokeJson([string]$Path, $Value) {
+              [IO.File]::WriteAllText($Path, (ConvertTo-Json -InputObject $Value -Depth 20) + "`n", [Text.UTF8Encoding]::new($false))
+          }
+          function Invoke-SmokeScoop([string]$Label, [string[]]$ScoopArguments, [switch]$AllowFailure) {
+              $watch = [Diagnostics.Stopwatch]::StartNew()
+              $start = [Diagnostics.ProcessStartInfo]::new()
+              $start.FileName = $scoopHost
+              $start.UseShellExecute = $false
+              $start.CreateNoWindow = $true
+              $start.RedirectStandardOutput = $true
+              $start.RedirectStandardError = $true
+              $start.Environment['PSModulePath'] = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
+              foreach ($argument in @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $scoopScript) + $ScoopArguments) {
+                  [void]$start.ArgumentList.Add($argument)
+              }
+              $process = [Diagnostics.Process]::new()
+              $process.StartInfo = $start
+              try {
+                  [void]$process.Start()
+                  $stdout = $process.StandardOutput.ReadToEndAsync()
+                  $stderr = $process.StandardError.ReadToEndAsync()
+                  $process.WaitForExit()
+                  $output = $stdout.GetAwaiter().GetResult() + "`n" + $stderr.GetAwaiter().GetResult()
+                  $exitCode = $process.ExitCode
+              } finally { $process.Dispose(); $watch.Stop() }
+              [IO.File]::WriteAllText((Join-Path $evidenceRoot ($Label + '.log')), $output, [Text.UTF8Encoding]::new($false))
+              Write-Host $output
+              [void]$summary.Commands.Add([pscustomobject]@{
+                  Name = $Label; Arguments = $ScoopArguments; ExitCode = $exitCode; Seconds = [Math]::Round($watch.Elapsed.TotalSeconds, 3)
+              })
+              if ($exitCode -ne 0 -and -not $AllowFailure) { throw "Scoop $Label failed with exit code $exitCode; see $Label.log." }
+              [pscustomobject]@{ ExitCode = $exitCode; Output = $output; Seconds = $watch.Elapsed.TotalSeconds }
+          }
+          function Update-SmokeTimestamp {
+              $configPath = Join-Path $env:SCOOP 'config.json'
+              $config = Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json
+              $config.last_update = (Get-Date).ToString('o')
+              Write-SmokeJson $configPath $config
+          }
+          function Get-SmokeReleaseAsset([string]$Version, [string]$Digest, [long]$KnownSize = 0, [string]$ReleaseTag = '') {
+              $headers = @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'font-bucket-native-smoke'; 'X-GitHub-Api-Version' = '2022-11-28' }
+              $apiToken = if ($env:GH_TOKEN) { $env:GH_TOKEN } else { $env:GITHUB_TOKEN }
+              if ($apiToken) { $headers.Authorization = 'Bearer ' + $apiToken }
+              if (-not $ReleaseTag) { $ReleaseTag = 'v' + $Version }
+              Assert-Smoke (($ReleaseTag -creplace '^[vV]', '') -ceq $Version) 'Unexpected native-test release tag.'
+              $release = Invoke-RestMethod -Uri ('https://api.github.com/repos/subframe7536/maple-font/releases/tags/' + [Uri]::EscapeDataString($ReleaseTag)) `
+                  -Headers $headers -TimeoutSec 60 -MaximumRetryCount 2 -RetryIntervalSec 2
+              Assert-Smoke ($release.tag_name -ceq $ReleaseTag -and -not $release.draft -and -not $release.prerelease) 'Unexpected official release metadata.'
+              $url = 'https://github.com/subframe7536/maple-font/releases/download/' + [Uri]::EscapeDataString($ReleaseTag) + '/MapleMono-OTF.zip'
+              $assetMatches = @($release.assets | Where-Object { $_.name -ceq 'MapleMono-OTF.zip' -and $_.browser_download_url -ceq $url })
+              Assert-Smoke ($assetMatches.Count -eq 1) 'Expected one official MapleMono-OTF.zip asset.'
+              $asset = $assetMatches[0]
+              Assert-Smoke ($asset.digest -cmatch '^sha256:[a-f0-9]{64}$' -and $asset.digest.Substring(7) -ceq $Digest.ToLowerInvariant()) 'Official release digest differs from the manifest or pinned old digest.'
+              Assert-Smoke ($asset.size -gt 0 -and $asset.size -le 10MB -and ($KnownSize -eq 0 -or $asset.size -eq $KnownSize)) 'Unexpected OTF archive size; review the smoke-test download bound.'
+              [pscustomobject]@{ Version = $Version; Url = $url; Hash = $Digest.ToLowerInvariant(); Size = [long]$asset.size; AssetId = $asset.id }
+          }
+          
+          # Read SFNT tables independently of the installer; no production lifecycle code is imported.
+          function Read-SmokeU16([byte[]]$Data, [int]$At) { [int]$Data[$At] * 256 + [int]$Data[$At + 1] }
+          function Read-SmokeU32([byte[]]$Data, [int]$At) {
+              [uint32]([uint64]$Data[$At] * 16777216 + [uint64]$Data[$At + 1] * 65536 + [uint64]$Data[$At + 2] * 256 + [uint64]$Data[$At + 3])
+          }
+          function Get-SmokeFont([string]$Path) {
+              $data = [IO.File]::ReadAllBytes($Path)
+              if ($data.Length -lt 12) { return }
+              $magic = [Text.Encoding]::ASCII.GetString($data, 0, 4)
+              if ($magic -notin @('OTTO', 'true') -and (Read-SmokeU32 $data 0) -ne 65536) { return }
+              $tableCount = Read-SmokeU16 $data 4
+              Assert-Smoke (12 + 16 * $tableCount -le $data.Length) ('Invalid font directory: ' + $Path)
+              $head = $null; $names = $null; $namesLength = 0
+              for ($index = 0; $index -lt $tableCount; $index++) {
+                  $record = 12 + 16 * $index
+                  $tag = [Text.Encoding]::ASCII.GetString($data, $record, 4)
+                  $offset = Read-SmokeU32 $data ($record + 8)
+                  $length = Read-SmokeU32 $data ($record + 12)
+                  Assert-Smoke ([uint64]$offset + $length -le $data.Length) ('Invalid font table: ' + $Path)
+                  if ($tag -ceq 'head') { $head = [int]$offset }
+                  if ($tag -ceq 'name') { $names = [int]$offset; $namesLength = [int]$length }
+              }
+              Assert-Smoke ($null -ne $head -and $head + 8 -le $data.Length -and $null -ne $names -and $namesLength -ge 6) ('Font metadata is missing: ' + $Path)
+              $nameCount = Read-SmokeU16 $data ($names + 2)
+              $stringBase = $names + (Read-SmokeU16 $data ($names + 4))
+              $postScript = $null; $bestScore = -1
+              for ($index = 0; $index -lt $nameCount; $index++) {
+                  $record = $names + 6 + 12 * $index
+                  Assert-Smoke ($record + 12 -le $names + $namesLength) ('Invalid font name records: ' + $Path)
+                  $platform = Read-SmokeU16 $data $record
+                  if ((Read-SmokeU16 $data ($record + 6)) -ne 6 -or $platform -notin @(0, 3)) { continue }
+                  $language = Read-SmokeU16 $data ($record + 4)
+                  $length = Read-SmokeU16 $data ($record + 8)
+                  $offset = $stringBase + (Read-SmokeU16 $data ($record + 10))
+                  Assert-Smoke ($offset + $length -le $names + $namesLength -and $length % 2 -eq 0) ('Invalid PostScript name: ' + $Path)
+                  $score = if ($platform -eq 3 -and $language -eq 1033) { 30 } elseif ($platform -eq 0) { 20 } else { 10 }
+                  if ($score -gt $bestScore) { $postScript = [Text.Encoding]::BigEndianUnicode.GetString($data, $offset, $length); $bestScore = $score }
+              }
+              Assert-Smoke (-not [string]::IsNullOrWhiteSpace($postScript)) ('No PostScript identity: ' + $Path)
+              [pscustomobject]@{
+                  Path = [IO.Path]::GetFullPath($Path); Key = $postScript; Revision = Read-SmokeU32 $data ($head + 4)
+                  Hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant(); Bytes = $data.Length
+              }
+          }
+          function Get-SmokeExpectedFonts($Asset, [string]$Label) {
+              [void](Invoke-SmokeScoop ($Label + '-download') @('download', $package, '--no-update-scoop'))
+              $prefix = $appName + '#' + $Asset.Version + '#'
+              $archives = @(Get-ChildItem -LiteralPath $env:SCOOP_CACHE -File | Where-Object { $_.Name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and $_.Extension -ieq '.zip' })
+              Assert-Smoke ($archives.Count -eq 1) 'Expected exactly one cached Scoop ZIP.'
+              $archive = $archives[0]
+              Assert-Smoke ($archive.Length -eq $Asset.Size -and (Get-FileHash -LiteralPath $archive.FullName).Hash.ToLowerInvariant() -ceq $Asset.Hash) 'Cached archive differs from the verified official asset.'
+              $destination = Join-Path $evidenceRoot ($Label + '-official-fonts')
+              $zip = [IO.Compression.ZipFile]::OpenRead($archive.FullName)
+              try {
+                  foreach ($entry in $zip.Entries) {
+                      Assert-Smoke ($entry.FullName -notmatch '(^[/\\]|(^|[/\\])\.\.([/\\]|$)|:)' -and (($entry.ExternalAttributes -shr 16) -band 0xF000) -ne 0xA000) 'Unsafe archive entry.'
+                  }
+              } finally { $zip.Dispose() }
+              [IO.Compression.ZipFile]::ExtractToDirectory($archive.FullName, $destination)
+              $expected = @{}
+              foreach ($file in Get-ChildItem -LiteralPath $destination -Recurse -File | Where-Object Extension -in @('.ttf', '.otf')) {
+                  $font = Get-SmokeFont $file.FullName
+                  Assert-Smoke ($null -ne $font -and -not $expected.ContainsKey($font.Key)) 'Official archive has missing or duplicate font identities.'
+                  $expected[$font.Key] = $font
+              }
+              Assert-Smoke ($expected.Count -gt 0 -and $expected.Count -le 64) 'Unexpected official archive font count.'
+              $summary.ArchiveBytes += $archive.Length
+              Write-SmokeJson (Join-Path $evidenceRoot ($Label + '-expected.json')) @($expected.Values | Sort-Object Key)
+              return $expected
+          }
+          function Get-SmokeRegistry {
+              foreach ($scope in @('HKLM', 'HKCU')) {
+                  $keyPath = $scope + ':\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
+                  if (-not (Test-Path -LiteralPath $keyPath)) { continue }
+                  $key = Get-Item -LiteralPath $keyPath
+                  foreach ($name in $key.GetValueNames()) {
+                      $value = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                      $path = $null
+                      if ($value -is [string]) {
+                          $expanded = [Environment]::ExpandEnvironmentVariables($value)
+                          if ([IO.Path]::IsPathRooted($expanded)) { $path = [IO.Path]::GetFullPath($expanded) }
+                          else {
+                              $path = Join-Path $machineFonts $expanded
+                              if ($scope -eq 'HKCU' -and (Test-Path -LiteralPath (Join-Path $userFonts $expanded))) { $path = Join-Path $userFonts $expanded }
+                          }
+                      }
+                      [pscustomobject]@{ Scope = $scope; Name = $name; Kind = [string]$key.GetValueKind($name); Value = ConvertTo-Json -InputObject $value -Compress -Depth 5; Path = $path }
+                  }
+              }
+          }
+          function Get-SmokePending {
+              $key = Get-Item -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+              if ('PendingFileRenameOperations' -notin $key.GetValueNames()) { return }
+              Assert-Smoke ($key.GetValueKind('PendingFileRenameOperations') -eq [Microsoft.Win32.RegistryValueKind]::MultiString) 'Unexpected pending-operation registry type.'
+              [string[]]$values = $key.GetValue('PendingFileRenameOperations', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+              for ($index = 0; $index -lt $values.Count; $index += 2) {
+                  [pscustomobject]@{ Source = [string]$values[$index]; Destination = $(if ($index + 1 -lt $values.Count) { [string]$values[$index + 1] } else { '' }) }
+              }
+          }
+          function Get-SmokeSnapshot {
+              $registry = @(Get-SmokeRegistry | Sort-Object Scope, Name)
+              $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+              $directories = [Collections.Generic.List[string]]::new()
+              foreach ($root in $fontRoots) {
+                  if (-not (Test-Path -LiteralPath $root)) { continue }
+                  foreach ($file in Get-ChildItem -LiteralPath $root -Recurse -File -Force) { [void]$paths.Add($file.FullName) }
+                  foreach ($directory in Get-ChildItem -LiteralPath $root -Recurse -Directory -Force) { $directories.Add($directory.FullName) }
+              }
+              foreach ($entry in $registry) {
+                  if ($entry.Path -and (Test-Path -LiteralPath $entry.Path -PathType Leaf)) { [void]$paths.Add($entry.Path) }
+              }
+              $files = @{}
+              foreach ($path in $paths) { $files[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() }
+              [pscustomobject]@{ Files = $files; Directories = $directories.ToArray(); Registry = $registry; Pending = @(Get-SmokePending) }
+          }
+          function Get-SmokeIsolatedPath([string]$NativePath) {
+              $plain = $NativePath -replace '^(?:\*1)?\\\?\?\\', '' -replace '^\\\\\?\\', ''
+              if (-not [IO.Path]::IsPathRooted($plain)) { throw ('Nonabsolute queued cleanup path: ' + $NativePath) }
+              $full = [IO.Path]::GetFullPath($plain)
+              foreach ($root in $fontRoots) {
+                  if (-not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
+                  $relative = $full.Substring($root.Length + 1)
+                  Assert-Smoke ($relative -match '^\.scoop-removed-[0-9a-f]{32}(?:\\(?:old|ready|failed)-[0-9a-f]{32}\.(?:ttf|otf))?$') ('Nonisolated or reusable queued path: ' + $NativePath)
+                  $directory = Join-Path $root ($relative.Split('\')[0])
+                  Assert-Smoke ($directory -notin $baseline.Directories) ('Cleanup reused a baseline directory: ' + $directory)
+                  return [pscustomobject]@{ Path = $full; Directory = $directory }
+              }
+              throw ('Queued cleanup escaped the font roots: ' + $NativePath)
+          }
+          function Assert-SmokePending($Snapshot) {
+              Assert-Smoke ($Snapshot.Pending.Count -ge $baseline.Pending.Count) 'Original pending cleanup entries disappeared.'
+              for ($index = 0; $index -lt $baseline.Pending.Count; $index++) {
+                  Assert-Smoke ($Snapshot.Pending[$index].Source -ceq $baseline.Pending[$index].Source -and $Snapshot.Pending[$index].Destination -ceq $baseline.Pending[$index].Destination) 'Original pending cleanup entries changed.'
+              }
+              $added = @{}
+              for ($index = $baseline.Pending.Count; $index -lt $Snapshot.Pending.Count; $index++) {
+                  $entry = $Snapshot.Pending[$index]
+                  Assert-Smoke ([string]::IsNullOrEmpty($entry.Destination)) 'A font transaction queued a rename destination rather than isolated deletion.'
+                  $isolated = Get-SmokeIsolatedPath $entry.Source
+                  Assert-Smoke (-not $added.ContainsKey($isolated.Path)) 'Duplicate new queued cleanup path.'
+                  $added[$isolated.Path] = $isolated
+              }
+              $summary.QueuedCleanup = @($added.Values | Sort-Object Path)
+              return $added
+          }
+          function Assert-SmokeState($Snapshot, [hashtable]$Expected, [string[]]$WantedKeys, [hashtable]$PreservePaths = @{}) {
+              $queued = Assert-SmokePending $Snapshot
+              foreach ($path in $baseline.Files.Keys) {
+                  Assert-Smoke ($Snapshot.Files.ContainsKey($path) -and $Snapshot.Files[$path] -ceq $baseline.Files[$path]) ('Unrelated font file changed: ' + $path)
+              }
+              $originalRegistry = @{}
+              foreach ($entry in $baseline.Registry) { $originalRegistry[$entry.Scope + ':' + $entry.Name] = $entry }
+              $currentRegistry = @{}
+              foreach ($entry in $Snapshot.Registry) { $currentRegistry[$entry.Scope + ':' + $entry.Name] = $entry }
+              foreach ($key in $originalRegistry.Keys) {
+                  $before = $originalRegistry[$key]; $after = $currentRegistry[$key]
+                  Assert-Smoke ($null -ne $after -and $after.Name -ceq $before.Name -and $after.Kind -ceq $before.Kind -and $after.Value -ceq $before.Value) ('Unrelated font registration changed: ' + $key)
+              }
+              $managed = @{}
+              foreach ($path in $Snapshot.Files.Keys | Where-Object { [IO.Path]::GetExtension($_) -in @('.ttf', '.otf') }) {
+                  # Queued transaction payloads are retired copies, not public installed fonts.
+                  if ([IO.Path]::GetDirectoryName($path) -match '\\\.scoop-removed-[0-9a-f]{32}$') { continue }
+                  if ($baseline.Files.ContainsKey($path)) {
+                      if (-not $baselineFonts.ContainsKey($path)) { $baselineFonts[$path] = Get-SmokeFont $path }
+                      $font = $baselineFonts[$path]
+                  } else { $font = Get-SmokeFont $path }
+                  if ($font -and $font.Key -in $WantedKeys) {
+                      Assert-Smoke (-not $managed.ContainsKey($font.Key)) ('Duplicate installed identity: ' + $font.Key)
+                      $managed[$font.Key] = $font
+                  }
+              }
+              Assert-Smoke ($managed.Count -eq $Expected.Count) 'Installed identity count differs from the expected official archive.'
+              $managedPaths = @{}
+              $preserved = 0
+              foreach ($key in $Expected.Keys) {
+                  $font = $managed[$key]; $official = $Expected[$key]
+                  Assert-Smoke ($null -ne $font -and [IO.Path]::GetDirectoryName($font.Path) -ieq $machineFonts -and $font.Hash -ceq $official.Hash -and $font.Revision -eq $official.Revision) ('Installed bytes/revision differ from the official font: ' + $key)
+                  if ($PreservePaths.ContainsKey($key)) { Assert-Smoke ($font.Path -ceq $PreservePaths[$key].Path) ('Windows filename changed: ' + $key); $preserved++ }
+                  $aliases = @($Snapshot.Registry | Where-Object Path -ieq $font.Path)
+                  Assert-Smoke ($aliases.Count -eq 1 -and $aliases[0].Scope -ceq 'HKLM' -and $aliases[0].Kind -ceq 'String') ('Expected one global font registration: ' + $key)
+                  $managedPaths[$font.Path] = $true
+              }
+              foreach ($entry in $Snapshot.Registry) {
+                  if (-not $originalRegistry.ContainsKey($entry.Scope + ':' + $entry.Name)) {
+                      Assert-Smoke ($entry.Scope -ceq 'HKLM' -and $entry.Path -and $managedPaths.ContainsKey($entry.Path)) ('Unexpected font registration: ' + $entry.Name)
+                  }
+              }
+              foreach ($path in $Snapshot.Files.Keys) {
+                  if ($baseline.Files.ContainsKey($path) -or $managedPaths.ContainsKey($path)) { continue }
+                  $isolated = Get-SmokeIsolatedPath $path
+                  Assert-Smoke ($queued.ContainsKey($path) -or $queued.ContainsKey($isolated.Directory)) ('Unqueued leftover font payload: ' + $path)
+              }
+              foreach ($directory in $Snapshot.Directories) {
+                  if ($directory -in $baseline.Directories) { continue }
+                  $isolated = Get-SmokeIsolatedPath $directory
+                  Assert-Smoke (@($queued.Values | Where-Object Directory -ieq $isolated.Directory).Count -gt 0) ('Unqueued transaction directory: ' + $directory)
+              }
+              [pscustomobject]@{ Fonts = $managed; Hashes = $managed.Count; PreservedPaths = $preserved; QueuedPaths = $queued.Count }
+          }
+          function Get-SmokeSavedVersion {
+              if (-not (Test-Path -LiteralPath $packageRoot)) { return }
+              $records = @(Get-ChildItem -LiteralPath $packageRoot -Directory | Where-Object { $_.Name -match '^\d+(\.\d+){1,3}$' } |
+                  ForEach-Object { Get-Item -LiteralPath (Join-Path $_.FullName 'scoop-install.json') -ErrorAction SilentlyContinue } | Sort-Object LastWriteTimeUtc)
+              if ($records.Count) { return $records[-1].Directory.Name }
+          }
+          function Assert-SmokeSources([string]$Version, [hashtable]$Expected) {
+              $root = Join-Path $packageRoot $Version
+              foreach ($name in @('.font-inventory.json', 'scoop-manifest.json', 'scoop-install.json')) { Assert-Smoke (Test-Path -LiteralPath (Join-Path $root $name) -PathType Leaf) ('Durable installation metadata missing: ' + $name) }
+              Assert-Smoke ((Get-SmokeSavedVersion) -ceq $Version) 'Saved installed version is incorrect.'
+              $saved = Get-Content -Raw -LiteralPath (Join-Path $root 'scoop-manifest.json') | ConvertFrom-Json
+              Assert-Smoke ($saved.version -ceq $Version -and ($saved.installer.script -join "`n") -ceq ($currentManifest.installer.script -join "`n")) 'Saved lifecycle or version differs from the tested manifest.'
+              $inventory = @(Get-Content -Raw -LiteralPath (Join-Path $root '.font-inventory.json') | ConvertFrom-Json)
+              Assert-Smoke ($inventory.Count -eq $Expected.Count) 'Inventory count differs from the official archive.'
+              $seen = @{}
+              foreach ($entry in $inventory) {
+                  Assert-Smoke ($Expected.ContainsKey($entry.Key) -and -not $seen.ContainsKey($entry.Key) -and $entry.Revision -eq $Expected[$entry.Key].Revision) 'Inventory identity/revision differs from the official archive.'
+                  $seen[$entry.Key] = $true
+                  $sourcePath = [IO.Path]::GetFullPath((Join-Path $root $entry.File))
+                  Assert-Smoke ($sourcePath.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase) -and -not (Test-Path -LiteralPath $sourcePath)) 'A source font was not pruned safely.'
+              }
+              Assert-Smoke (@(Get-ChildItem -LiteralPath $root -Recurse -File | Where-Object Extension -in @('.ttf', '.otf')).Count -eq 0) 'Font payloads remain in the version directory.'
+              Assert-Smoke (@(Get-ChildItem -LiteralPath $env:SCOOP_CACHE -File | Where-Object { $_.Name.StartsWith($appName + '#', [StringComparison]::OrdinalIgnoreCase) }).Count -eq 0) 'Font download cache remains after successful cleanup.'
+              $current = Get-Item -LiteralPath (Join-Path $packageRoot 'current') -Force
+              $target = [string]$current.Target
+              if (-not [IO.Path]::IsPathRooted($target)) { $target = Join-Path $packageRoot $target }
+              Assert-Smoke ([IO.Path]::GetFullPath($target).TrimEnd('\') -ieq $root) 'Current junction points to the wrong version.'
+          }
+          function Add-SmokePhase([string]$Name, [string]$Version, $Proof, $Watch) {
+              $record = [pscustomobject]@{ Phase = $Name; Version = $Version; Fonts = $Proof.Hashes; Hashes = $Proof.Hashes; PreservedPaths = $Proof.PreservedPaths; QueuedPaths = $Proof.QueuedPaths; Seconds = [Math]::Round($Watch.Elapsed.TotalSeconds, 3) }
+              [void]$summary.Phases.Add($record)
+              Write-Host ('[native-smoke] ' + ($record | ConvertTo-Json -Compress))
+          }
+          
+          try {
+              New-Item -ItemType Directory -Force -Path $core, $evidenceRoot, "$env:SCOOP\buckets", "$env:SCOOP\shims", $env:SCOOP_CACHE, "$env:SCOOP_GLOBAL\apps", "$env:SCOOP_GLOBAL\shims" | Out-Null
+              Add-Content -LiteralPath $env:GITHUB_ENV -Value ('FONT_NATIVE_EVIDENCE_ROOT=' + $evidenceRoot) -Encoding utf8
+              $sourceManifest = Join-Path $env:GITHUB_WORKSPACE ('bucket\' + $appName + '.json')
+              $currentManifestBytes = [IO.File]::ReadAllBytes($sourceManifest)
+              $currentManifest = [Text.Encoding]::UTF8.GetString($currentManifestBytes) | ConvertFrom-Json
+              Assert-Smoke ($currentManifest.version -match '^\d+(\.\d+){1,3}$' -and [version]$currentManifest.version -gt [version]$oldVersion -and $currentManifest.hash -match '^[a-fA-F0-9]{64}$') 'The current manifest must be a verified release newer than 7.7.'
+              $summary.NewVersion = [string]$currentManifest.version
+              $oldAsset = Get-SmokeReleaseAsset $oldVersion $oldDigest 1756678
+              $newTag = [Uri]::UnescapeDataString(([Uri]$currentManifest.url).Segments[-2].TrimEnd('/'))
+              $newAsset = Get-SmokeReleaseAsset $currentManifest.version $currentManifest.hash -ReleaseTag $newTag
+              Assert-Smoke ($currentManifest.url -ceq $newAsset.Url) 'The manifest must select the official MapleMono OTF asset.'
+              Write-SmokeJson (Join-Path $evidenceRoot 'official-assets.json') @($oldAsset, $newAsset)
+              git init --quiet $core
+              git -C $core remote add origin https://github.com/ScoopInstaller/Scoop.git
+              git -C $core fetch --quiet --depth=1 origin $scoopPin
+              git -C $core checkout --quiet --detach FETCH_HEAD
+              Assert-Smoke ((git -C $core rev-parse HEAD) -ceq $scoopPin) 'Scoop source pin mismatch.'
+              Write-SmokeJson (Join-Path $env:SCOOP 'config.json') @{ last_update = (Get-Date).ToString('o'); use_external_7zip = $true; 'aria2-enabled' = $false }
+              $env:PATH = (Join-Path $env:ProgramFiles '7-Zip') + ';' + $env:PATH
+              Get-Command 7z -CommandType Application -ErrorAction Stop | Out-Null
+              [void](Invoke-SmokeScoop 'add-local-bucket' @('bucket', 'add', 'smoke', ([Uri]$env:GITHUB_WORKSPACE).AbsoluteUri))
+              $testManifestPath = Join-Path $env:SCOOP ('buckets\smoke\bucket\' + $appName + '.json')
+              $oldManifest = [Text.Encoding]::UTF8.GetString($currentManifestBytes) | ConvertFrom-Json
+              $oldManifest.version = $oldVersion; $oldManifest.url = $oldAsset.Url; $oldManifest.hash = $oldAsset.Hash
+              Write-SmokeJson $testManifestPath $oldManifest
+              $expectedOld = Get-SmokeExpectedFonts $oldAsset 'old'
+              # Prefetch the new expected data only after old install: successful cleanup prunes every app cache version.
+              $baseline = Get-SmokeSnapshot
+              $initial = Assert-SmokeState $baseline @{} @($expectedOld.Keys)
+              Write-SmokeJson (Join-Path $evidenceRoot 'baseline.json') $baseline
+          
+              $phaseWatch = [Diagnostics.Stopwatch]::StartNew()
+              $installationStarted = $true
+              [void](Invoke-SmokeScoop 'install-old' @('install', $package, '--global', '--no-update-scoop'))
+              Assert-SmokeSources $oldVersion $expectedOld
+              $afterOld = Get-SmokeSnapshot
+              $oldProof = Assert-SmokeState $afterOld $expectedOld @($expectedOld.Keys)
+              Add-SmokePhase 'install' $oldVersion $oldProof $phaseWatch
+              Write-SmokeJson (Join-Path $evidenceRoot 'after-install.json') $afterOld
+              $oldMetadata = @{}
+              foreach ($path in @((Join-Path $packageRoot '.font-ownership.json'), (Join-Path $packageRoot "$oldVersion\.font-inventory.json"), (Join-Path $packageRoot "$oldVersion\scoop-manifest.json"), (Join-Path $packageRoot "$oldVersion\scoop-install.json"))) { $oldMetadata[$path] = (Get-FileHash -LiteralPath $path).Hash }
+          
+              [IO.File]::WriteAllBytes($testManifestPath, $currentManifestBytes)
+              $expectedNew = Get-SmokeExpectedFonts $newAsset 'current'
+              $wantedKeys = @(@($expectedOld.Keys) + @($expectedNew.Keys) | Sort-Object -Unique)
+              foreach ($path in $baseline.Files.Keys | Where-Object { [IO.Path]::GetExtension($_) -in @('.ttf', '.otf') }) {
+                  $existing = $baselineFonts[$path]
+                  Assert-Smoke (-not $existing -or -not $expectedNew.ContainsKey($existing.Key)) 'The runner already contained an identity introduced by the current archive.'
+              }
+              $changed = @($expectedNew.Keys | Where-Object { $expectedOld.ContainsKey($_) -and $expectedNew[$_].Hash -cne $expectedOld[$_].Hash })
+              Assert-Smoke ($changed.Count -gt 0) 'The two official releases contain no changed common font to test.'
+          
+              Add-Type -TypeDefinition @'
+          using System;
+          using System.Collections.Generic;
+          using System.Runtime.InteropServices;
+          public static class FontSmokeRestartManager {
+              [StructLayout(LayoutKind.Sequential)] struct Proc { public int Id; public System.Runtime.InteropServices.ComTypes.FILETIME Started; }
+              [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct App {
+                  public Proc Process;
+                  [MarshalAs(UnmanagedType.ByValTStr,SizeConst=256)] public string Name;
+                  [MarshalAs(UnmanagedType.ByValTStr,SizeConst=64)] public string Service;
+                  public uint Type, Status, Session;
+                  [MarshalAs(UnmanagedType.Bool)] public bool Restartable;
+              }
+              [DllImport("rstrtmgr.dll",CharSet=CharSet.Unicode)] static extern int RmStartSession(out uint handle,int flags,System.Text.StringBuilder key);
+              [DllImport("rstrtmgr.dll",CharSet=CharSet.Unicode)] static extern int RmRegisterResources(uint handle,uint files,string[] paths,uint apps,IntPtr processes,uint services,IntPtr names);
+              [DllImport("rstrtmgr.dll",CharSet=CharSet.Unicode)] static extern int RmGetList(uint handle,out uint needed,ref uint count,[In,Out] App[] apps,out uint reasons);
+              [DllImport("rstrtmgr.dll")] static extern int RmEndSession(uint handle);
+              public static int[] Owners(string path) {
+                  uint handle;
+                  if(RmStartSession(out handle,0,new System.Text.StringBuilder(33))!=0)return new int[0];
+                  try {
+                      if(RmRegisterResources(handle,1,new string[]{path},0,IntPtr.Zero,0,IntPtr.Zero)!=0)return new int[0];
+                      uint needed,count=0,reasons;
+                      if(RmGetList(handle,out needed,ref count,null,out reasons)!=234 || needed==0)return new int[0];
+                      App[] apps=new App[needed];count=needed;
+                      if(RmGetList(handle,out needed,ref count,apps,out reasons)!=0)return new int[0];
+                      var ids=new List<int>();for(int i=0;i<count;i++)ids.Add(apps[i].Process.Id);return ids.ToArray();
+                  } finally { RmEndSession(handle); }
+              }
+          }
+          '@
+              $phaseWatch = [Diagnostics.Stopwatch]::StartNew()
+              $lockedKey = @($changed | Sort-Object)[-1]
+              $lockedPath = $oldProof.Fonts[$lockedKey].Path
+              $fontLock = [IO.File]::Open($lockedPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+              try {
+                  try { $summary.LockParentObservable = $PID -in @([FontSmokeRestartManager]::Owners($lockedPath)) } catch { Write-Warning ('Read-only lock-owner probe unavailable: ' + $_.Exception.Message) }
+                  Update-SmokeTimestamp
+                  $blocked = Invoke-SmokeScoop 'blocked-update' @('update', $package, '--global') -AllowFailure
+                  Assert-Smoke ($blocked.ExitCode -ne 0) 'The intentionally locked update unexpectedly succeeded.'
+                  Assert-Smoke ($blocked.Output -match 'Font\s+transaction\s+stopped' -and $blocked.Output -match 'Rollback\s+completed\.') 'The failed update did not report a completed native rollback.'
+                  $summary.LockParentReported = $blocked.Output -match ('\(PID\s+' + $PID + '\)')
+                  if ($summary.LockParentObservable) { Assert-Smoke $summary.LockParentReported 'Restart Manager sees the parent lock, but the failure diagnostic omitted its PID.' }
+                  elseif (-not $summary.LockParentReported) { Write-Warning 'Restart Manager did not identify this ordinary file handle; rollback assertions still apply.' }
+                  Assert-Smoke ((Get-SmokeSavedVersion) -ceq $oldVersion) 'The blocked update lost the old saved installation record.'
+                  foreach ($path in $oldMetadata.Keys) { Assert-Smoke ((Get-FileHash -LiteralPath $path).Hash -ceq $oldMetadata[$path]) ('Rollback changed durable old installation metadata: ' + $path) }
+                  $afterBlocked = Get-SmokeSnapshot
+                  $blockedProof = Assert-SmokeState $afterBlocked $expectedOld $wantedKeys $oldProof.Fonts
+                  Assert-Smoke (($afterBlocked.Registry | ConvertTo-Json -Compress -Depth 8) -ceq ($afterOld.Registry | ConvertTo-Json -Compress -Depth 8)) 'Rollback did not restore exact font registrations.'
+                  Add-SmokePhase 'blocked update and rollback' $oldVersion $blockedProof $phaseWatch
+                  Write-SmokeJson (Join-Path $evidenceRoot 'after-blocked-update.json') $afterBlocked
+              } finally { $fontLock.Dispose(); $fontLock = $null }
+          
+              $phaseWatch = [Diagnostics.Stopwatch]::StartNew()
+              Update-SmokeTimestamp
+              [void](Invoke-SmokeScoop 'retry-update' @('update', $package, '--global'))
+              Assert-SmokeSources $currentManifest.version $expectedNew
+              Assert-Smoke (-not (Test-Path -LiteralPath (Join-Path $packageRoot $oldVersion))) 'The successful upgrade retained the old version directory.'
+              $afterUpdate = Get-SmokeSnapshot
+              $newProof = Assert-SmokeState $afterUpdate $expectedNew $wantedKeys $oldProof.Fonts
+              Assert-Smoke ($newProof.PreservedPaths -gt 0) 'No existing Windows filename was exercised by the upgrade.'
+              Add-SmokePhase 'upgrade retry' $currentManifest.version $newProof $phaseWatch
+              Write-SmokeJson (Join-Path $evidenceRoot 'after-upgrade.json') $afterUpdate
+          
+              $phaseWatch = [Diagnostics.Stopwatch]::StartNew()
+              [void](Invoke-SmokeScoop 'uninstall-current' @('uninstall', $package, '--global'))
+              $uninstalled = $true
+              Assert-Smoke (-not (Test-Path -LiteralPath $packageRoot)) 'The uninstalled Scoop package directory remains.'
+              $afterUninstall = Get-SmokeSnapshot
+              $removedProof = Assert-SmokeState $afterUninstall @{} $wantedKeys
+              Add-SmokePhase 'uninstall' $currentManifest.version $removedProof $phaseWatch
+              Write-SmokeJson (Join-Path $evidenceRoot 'after-uninstall.json') $afterUninstall
+              Assert-Smoke ((git -C $core rev-parse HEAD) -ceq $scoopPin) 'Scoop changed its pinned source during the test.'
+              Assert-Smoke ([Convert]::ToBase64String([IO.File]::ReadAllBytes($sourceManifest)) -ceq [Convert]::ToBase64String($currentManifestBytes)) 'The production checkout manifest was modified.'
+              $summary.Status = 'passed'
+          } catch {
+              $failure = $_
+              $summary.Status = 'failed'
+              $summary.Failure = $_.Exception.Message
+          } finally {
+              if ($fontLock) { $fontLock.Dispose(); $fontLock = $null }
+              if ($failure -and $installationStarted -and -not $uninstalled) {
+                  try {
+                      if (Get-SmokeSavedVersion) {
+                          $cleanup = Invoke-SmokeScoop 'failure-uninstall' @('uninstall', $package, '--global') -AllowFailure
+                          $summary.FailureCleanup = 'Scoop uninstall exit ' + $cleanup.ExitCode
+                      } else { $summary.FailureCleanup = 'No saved installed version; disposable runner teardown is the cleanup boundary.' }
+                  } catch { $summary.FailureCleanup = $_.Exception.Message; Write-Warning ('Failure cleanup: ' + $_.Exception.Message) }
+              }
+              $summary.TotalSeconds = [Math]::Round($runWatch.Elapsed.TotalSeconds, 3)
+              if (Test-Path -LiteralPath $evidenceRoot) {
+                  try { Write-SmokeJson (Join-Path $evidenceRoot 'summary.json') $summary } catch { Write-Warning $_.Exception.Message }
+              }
+              Write-Host ('Native smoke summary: ' + (ConvertTo-Json -InputObject $summary -Depth 8 -Compress))
+              if ($env:GITHUB_STEP_SUMMARY) {
+                  try {
+                      $lines = @('### Native font lifecycle', '', ('Status: **' + $summary.Status + '**. Official archives: ' + $summary.ArchiveBytes + ' bytes. Duration: ' + $summary.TotalSeconds + ' s.'), '', '| Phase | Release | Fonts / hashes | Preserved paths | Queued paths | Seconds |', '| --- | --- | --- | --- | --- | --- |')
+                      foreach ($phase in $summary.Phases) { $lines += '| ' + $phase.Phase + ' | ' + $phase.Version + ' | ' + $phase.Fonts + ' / ' + $phase.Hashes + ' | ' + $phase.PreservedPaths + ' | ' + $phase.QueuedPaths + ' | ' + $phase.Seconds + ' |' }
+                      $lines += @('', ('Parent lock PID: ' + $PID + '; observable: ' + $summary.LockParentObservable + '; reported: ' + $summary.LockParentReported + '.'), ('Added isolated cleanup paths: ' + $summary.QueuedCleanup.Count + '. No restart requested.'), ('Evidence: `' + $evidenceRoot + '`.'))
+                      Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($lines -join "`n") -Encoding utf8
+                  } catch { Write-Warning ('Cannot write Actions summary: ' + $_.Exception.Message) }
+              }
+          }
+          if ($failure) { throw $failure }
+      - name: Save native verification evidence
+        if: always() && !cancelled() && env.FONT_NATIVE_EVIDENCE_ROOT != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-fonts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.FONT_NATIVE_EVIDENCE_ROOT }}/*.json
+            ${{ env.FONT_NATIVE_EVIDENCE_ROOT }}/*.log
+          retention-days: 14
+          if-no-files-found: error
