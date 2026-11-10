@@ -1,10 +1,10 @@
 {
-  "version": "2026.10.25",
+  "version": "2026.11.10",
   "description": "Ark Pixel 12px proportional OTF desktop fonts with language-specific glyph variants.",
   "homepage": "https://github.com/TakWolf/ark-pixel-font",
   "license": "OFL-1.1",
-  "url": "https://github.com/TakWolf/ark-pixel-font/releases/download/2026.10.25/ark-pixel-font-12px-proportional-otf-v2026.10.25.zip",
-  "hash": "1a5c194397b7b30685c2126df1c0f0183c14367befd2e6291c9b3184bc187fc7",
+  "url": "https://github.com/TakWolf/ark-pixel-font/releases/download/2026.11.10/ark-pixel-font-12px-proportional-otf-v2026.11.10.zip",
+  "hash": "f04feec4c007dea65d297a06794108cc6aaee575781dd63f66dbaff009491601",
   "installer": {
     "script": [
       "param([switch]$Uninstall,[switch]$CheckOnly,[switch]$Cleanup)",

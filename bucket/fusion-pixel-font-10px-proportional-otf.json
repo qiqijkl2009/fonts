@@ -1,10 +1,10 @@
 {
-  "version": "2026.10.25",
+  "version": "2026.11.10",
   "description": "Fusion Pixel 10px proportional OTF desktop fonts with language-specific glyph variants.",
   "homepage": "https://github.com/TakWolf/fusion-pixel-font",
   "license": "OFL-1.1",
-  "url": "https://github.com/TakWolf/fusion-pixel-font/releases/download/2026.10.25/fusion-pixel-font-10px-proportional-otf-v2026.10.25.zip",
-  "hash": "a3e4129332fc49c30358408d0942b23025f17b518d0718b72330089ec745d224",
+  "url": "https://github.com/TakWolf/fusion-pixel-font/releases/download/2026.11.10/fusion-pixel-font-10px-proportional-otf-v2026.11.10.zip",
+  "hash": "24465febb2086fbd35a8069e79dd106d87d7c75909f0c04ddc8fb419de38f34b",
   "installer": {
     "script": [
       "param([switch]$Uninstall,[switch]$CheckOnly,[switch]$Cleanup)",

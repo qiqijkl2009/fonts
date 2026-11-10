@@ -1,10 +1,10 @@
 {
-  "version": "2026.10.25",
+  "version": "2026.11.10",
   "description": "Fusion Pixel 12px monospaced OTF desktop fonts with language-specific glyph variants.",
   "homepage": "https://github.com/TakWolf/fusion-pixel-font",
   "license": "OFL-1.1",
-  "url": "https://github.com/TakWolf/fusion-pixel-font/releases/download/2026.10.25/fusion-pixel-font-12px-monospaced-otf-v2026.10.25.zip",
-  "hash": "6e4cd37ad32ccdab76858759397a01c3ec372ac37fdf3acf0705da7b44281302",
+  "url": "https://github.com/TakWolf/fusion-pixel-font/releases/download/2026.11.10/fusion-pixel-font-12px-monospaced-otf-v2026.11.10.zip",
+  "hash": "92aa7958879fb9bbf0f8518184a9641b83dd9543397bdf5d1c53cb6cd75c111a",
   "installer": {
     "script": [
       "param([switch]$Uninstall,[switch]$CheckOnly,[switch]$Cleanup)",

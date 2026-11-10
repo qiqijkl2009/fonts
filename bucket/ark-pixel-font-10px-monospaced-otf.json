@@ -1,10 +1,10 @@
 {
-  "version": "2026.10.25",
+  "version": "2026.11.10",
   "description": "Ark Pixel 10px monospaced OTF desktop fonts with language-specific glyph variants.",
   "homepage": "https://github.com/TakWolf/ark-pixel-font",
   "license": "OFL-1.1",
-  "url": "https://github.com/TakWolf/ark-pixel-font/releases/download/2026.10.25/ark-pixel-font-10px-monospaced-otf-v2026.10.25.zip",
-  "hash": "ff27ad5d54b93275226402122a47ab6e5a25d83cf6ca9c5ba71cfff415407d48",
+  "url": "https://github.com/TakWolf/ark-pixel-font/releases/download/2026.11.10/ark-pixel-font-10px-monospaced-otf-v2026.11.10.zip",
+  "hash": "3cdb47489a2e00baeb232eac5ee1e1887abaf3e66378d1e39b1457cfa00b2009",
   "installer": {
     "script": [
       "param([switch]$Uninstall,[switch]$CheckOnly,[switch]$Cleanup)",
